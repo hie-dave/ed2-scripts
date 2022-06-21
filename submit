@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+#
+# Portable bash script to run ED2 as a parallel job using PBS on Gadi.
+#
+# Usage:
+#
+# submit -c <config file>
+#
+# -c: Path to a file containing configuration/input variables. This file will be
+#     sourced by the bash interpreter, so should contain lines of the form
+#     NAME=value. An example file is provided alongside this script.
+#
+
+# Exit immediately if:
+# - Any command fails
+# - Any part of a pipeline fails
+# - We reference any unbound variables
+set -euo pipefail
+
+# Parse command line arguments.
+USAGE="Usage: $0 -c <config file>"
+while getopts ":hc:" opt
+do
+	case ${opt} in
+		c ) CONFIG_FILE="${OPTARG}" ;;
+		h ) echo "${USAGE}"; exit 0 ;;
+		: ) echo "${USAGE}"; exit 1 ;;
+	esac
+done
+
+# Ensure that the config file option was provided.
+if [ -z "${CONFIG_FILE:-}" ]
+then
+	echo "Error: No config file specified."
+	echo "${USAGE}"
+	exit 1
+fi
+
+# Ensure that the config file exists.
+if [ ! -f "${CONFIG_FILE}" ]
+then
+	echo "Error: File not found: ${CONFIG_FILE}"
+	exit 1
+fi
+
+# Source the config file.
+source "${CONFIG_FILE}"
+
+# ------------------------------------------------------------------------------
+# Input checking/validation.
+# ------------------------------------------------------------------------------
+
+# This function takes 1 argument - the name of a variable. If the variable is
+# not set, it will print an error message and return 1.
+function ensure_variable_set() {
+	if [ $# -ne 1 ]
+	then
+		echo "Error: no argument passed to ensure_variable_set()"
+		exit 1
+	fi
+
+	if [ -z "${!1:-}" ]
+	then
+		echo "Error: variable $1 not set in config file ${CONFIG_FILE}"
+		exit 1
+	fi
+}
+
+# This function will perform the specified check on the given file, and if the
+# check fails, will print the specified message and exit.
+#
+# Arguments:
+# - An argument to the test command - e.g. -f to check if file exists.
+# - The file path
+# - Error message
+function check_permission() {
+  if [ ! $1 "$2" ]
+  then
+    echo $3
+    exit 1
+  fi
+}
+
+# Check if a file exists. If it does not, print an error message and return
+# non-zero exit code.
+#
+# Arguments:
+# - The file to be checked
+function check_file_exists() {
+  check_permission -f $1 "Error: $1 does not exist"
+}
+
+# Check if a directory exists. If it does not, print an error message and return
+# non-zero exit code.
+#
+# Arguments:
+# - The file to be checked
+function check_directory_exists() {
+  check_permission -d $1 "Error: Directory $1 does not exist"
+}
+
+# Check if a file or directory has read permission for the current user. If it
+# doesn't, print an error message and return a non-zero exit code.
+#
+# Arguments:
+# - The file to be checked
+function check_read() {
+  check_permission -r $1 "Error: $1 does not have read permission"
+}
+
+# Check if a file or directory has read permission for the current user. If it
+# doesn't, print an error message and return a non-zero exit code.
+#
+# Arguments:
+# - The file to be checked
+function check_write() {
+  check_permission -w $1 "Error: $1 does not have write permission"
+}
+
+# Check if a file or directory has execute permission for the current user. If
+# it doesn't, print an error message and return a non-zero exit code.
+#
+# Arguments:
+# - The file to be checked
+function check_execute() {
+  check_permission -x $1 "Error: $1 does not have execute permission"
+}
+
+# This function will print the absolute path to the given filename.
+# We could use readlink, but it's a Linux tool - not available on MacOS (afaik).
+function get_absolute_path() {
+  echo $( cd "$(dirname "$1")"; pwd -P )/$(basename "$1")
+}
+
+# Ensure that all required variables were set. Due to set -e above, if any of
+# these function invocations return 1, script execution will be aborted.
+ensure_variable_set OUT_DIR
+ensure_variable_set BINARY
+ensure_variable_set NAMELIST
+ensure_variable_set NPROCESS
+ensure_variable_set WALLTIME
+ensure_variable_set MEMORY
+ensure_variable_set QUEUE
+ensure_variable_set PROJECT
+ensure_variable_set EMAIL
+ensure_variable_set EMAIL_NOTIFICATIONS
+ensure_variable_set JOB_NAME
+
+# If the output directory exists, ensure that we have write permissions.
+# If it doesn't exist, we'll create it later.
+if [ -d "${OUT_DIR}" ]
+then
+	check_write "${OUT_DIR}"
+fi
+
+# Ensure that the ED2 binary exists and that we have write permission.
+check_file_exists "${BINARY}"
+check_execute "${BINARY}"
+
+# Ensure that the namelist file exists.
+check_file_exists "${NAMELIST}"
+
+# Ensure that the user provided a valid walltime.
+WALLTIME_REGEX="([0-9]{2}):([0-9]{2}):([0-9]{2})"
+if ! echo "${WALLTIME}" | grep -qE "${WALLTIME_REGEX}"
+then
+	echo "Error: invalid WALLTIME: must be hh:mm:ss but was ${WALLTIME}"
+	exit 1
+fi
+
+# Parse minutes/seconds values from the walltime and ensure they're <60.
+WALLTIME_MINUTES=$(echo "${WALLTIME}" | sed -En -e "s/${WALLTIME_REGEX}/\2/gp")
+WALLTIME_SECONDS=$(echo "${WALLTIME}" | sed -En -e "s/${WALLTIME_REGEX}/\3/gp")
+
+if [ "${WALLTIME_MINUTES}" -ge 60 ]
+then
+	echo "Error: walltime number of minutes must be <60"
+	exit 1
+fi
+
+if [ "${WALLTIME_SECONDS}" -ge 60 ]
+then
+	echo "Error: walltime number of seconds must be <60"
+	exit 1
+fi
+
+# Ensure that the specified queue is a valid queue on this PBS server.
+if ! qstat -q "${QUEUE}" >/dev/null 2>&1
+then
+	echo "Error: queue ${QUEUE} does not exist"
+fi
+
+# I'm not going to validate the email address...I leave that as an exercise for
+# the enthusiastic programmer.
+
+# Get PBS options for email notifications.
+# Check the qsub man page for more details.
+if [ ${EMAIL_NOTIFICATIONS} -eq 1 ]
+then
+  EMAIL_OPT=abe
+else
+  EMAIL_OPT=n
+fi
+
+# Convert to absolute paths.
+BINARY="$(get_absolute_path "${BINARY}")"
+OUT_DIR="$(get_absolute_path "${BINARY}")/${JOB_NAME}"
+
+# Create output directory if necessary.
+if [ ! -d "${OUT_DIR}" ]
+then
+	mkdir -p "${OUT_DIR}"
+fi
+
+# Working directory will be the directory containing the namelist file, because
+# the namelist can contain relative paths.
+WORKING_DIRECTORY="$( cd "$( dirname "${NAMELIST}" )" >/dev/null 2>&1 && pwd -P )"
+OUTPUT_LOG="${OUT_DIR}/${JOB_NAME}.log"
+
+# ------------------------------------------------------------------------------
+# Generate the PBS script.
+# ------------------------------------------------------------------------------
+SUBMIT_SCRIPT="${OUT_DIR}/submit_to_pbs"
+cat <<EOF > "${SUBMIT_SCRIPT}"
+#!/usr/bin/env bash
+#PBS -l ncpus=${NPROCESS}
+#PBS -l walltime=${WALLTIME}
+#PBS -l mem=${MEMORY}
+#PBS -q ${QUEUE}
+#PBS -P ${PROJECT}
+#PBS -m ${EMAIL_OPT}
+#PBS -M ${EMAIL}
+#PBS -j oe
+#PBS -o ${OUTPUT_LOG}
+#PBS -l wd
+#PBS -W umask=0022
+#PBS -S /bin/bash
+#PBS -l storage=/scratch/${PROJECT}
+#PBS -N ${JOB_NAME}
+set -euo pipefail
+module purge
+module load openmpi/4.1.1
+module load hdf5/1.12.1
+umask 022
+cd ${WORKING_DIRECTORY}
+mpirun -np ${NPROCESS} ${BINARY} -f "${NAMELIST}"
+EOF
+
+# Submit the job to PBS.
+JOB_ID=$(qsub "${SUBMIT_SCRIPT}")
+
+# Success!
+echo "Job successfully submitted to PBS. Job ID is:"
+echo ${JOB_ID}
+echo "Job output will be written to:"
+echo ${OUTPUT_LOG}
