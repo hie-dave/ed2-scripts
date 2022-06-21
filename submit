@@ -134,7 +134,6 @@ function get_absolute_path() {
 
 # Ensure that all required variables were set. Due to set -e above, if any of
 # these function invocations return 1, script execution will be aborted.
-ensure_variable_set OUT_DIR
 ensure_variable_set BINARY
 ensure_variable_set NAMELIST
 ensure_variable_set NPROCESS
@@ -145,13 +144,6 @@ ensure_variable_set PROJECT
 ensure_variable_set EMAIL
 ensure_variable_set EMAIL_NOTIFICATIONS
 ensure_variable_set JOB_NAME
-
-# If the output directory exists, ensure that we have write permissions.
-# If it doesn't exist, we'll create it later.
-if [ -d "${OUT_DIR}" ]
-then
-	check_write "${OUT_DIR}"
-fi
 
 # Ensure that the ED2 binary exists and that we have write permission.
 check_file_exists "${BINARY}"
@@ -204,23 +196,16 @@ fi
 
 # Convert to absolute paths.
 BINARY="$(get_absolute_path "${BINARY}")"
-OUT_DIR="$(get_absolute_path "${BINARY}")/${JOB_NAME}"
-
-# Create output directory if necessary.
-if [ ! -d "${OUT_DIR}" ]
-then
-	mkdir -p "${OUT_DIR}"
-fi
 
 # Working directory will be the directory containing the namelist file, because
 # the namelist can contain relative paths.
 WORKING_DIRECTORY="$( cd "$( dirname "${NAMELIST}" )" >/dev/null 2>&1 && pwd -P )"
-OUTPUT_LOG="${OUT_DIR}/${JOB_NAME}.log"
+OUTPUT_LOG="${WORKING_DIRECTORY}/${JOB_NAME}.log"
 
 # ------------------------------------------------------------------------------
 # Generate the PBS script.
 # ------------------------------------------------------------------------------
-SUBMIT_SCRIPT="${OUT_DIR}/submit_to_pbs"
+SUBMIT_SCRIPT="$(mktemp)"
 cat <<EOF > "${SUBMIT_SCRIPT}"
 #!/usr/bin/env bash
 #PBS -l ncpus=${NPROCESS}
